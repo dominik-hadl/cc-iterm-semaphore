@@ -1,0 +1,90 @@
+#!/bin/bash
+# cc-semaphore-watch — background companion of cc-semaphore (started by it on
+# demand, exits once no Claude session has been tracked for a while).
+#
+# Claude Code fires no hook when you interrupt it with Esc (state would stay
+# "working") or when you approve a permission prompt (state would stay
+# "waiting" until the tool finishes). Its terminal title does reflect both: a
+# spinner (◐◑◒◓) while busy, ✳ when not. Once a session's state has settled,
+# a mismatch seen on two consecutive polls is corrected — in our colours and
+# in iTerm2's own Session Status (via its cc-status hook).
+#
+# The spinner also keeps turning while a background agent runs, even with a
+# question on screen. So "ask" (AskUserQuestion / plan / MCP elicitation) is
+# never second-guessed, and a permission wait only counts as approved when
+# the spinner was seen stopped during it and then restarted.
+
+STATE_DIR="${TMPDIR:-/tmp}/cc-semaphore"
+IT2=${CC_SEMAPHORE_IT2:-/Applications/iTerm.app/Contents/Resources/utilities/it2}
+CC_STATUS=${CC_SEMAPHORE_CC_STATUS:-$HOME/.config/iterm2/cc-status}  # iTerm2's own hook, optional
+HOOK="$(dirname "$0")/cc-semaphore"
+GRACE=2       # seconds a hook-set state is trusted before it is second-guessed
+IDLE_EXIT=120 # seconds without tracked sessions before exiting
+
+mkdir -p "$STATE_DIR"
+echo $$ > "$STATE_DIR/.watch.pid"
+empty_since=$(date +%s)
+
+LOG="$STATE_DIR/.watch.log"
+
+correct() {  # sid tty state cc-status-event
+  echo "$(date '+%F %T') $1 $state -> $3 (title: $title)" >> "$LOG"
+  [ "$(wc -l < "$LOG")" -gt 1000 ] && tail -500 "$LOG" > "$LOG.tmp" && mv "$LOG.tmp" "$LOG"
+  printf '{"hook_event_name":"SemaphoreWatch","state":"%s"}' "$3" |
+    ITERM_SESSION_ID="w0t0p0:$1" CC_SEMAPHORE_TTY=$2 "$HOOK"
+  [ -x "$CC_STATUS" ] && printf '{"hook_event_name":"%s"}' "$4" |
+    ITERM_SESSION_ID="w0t0p0:$1" "$CC_STATUS" >/dev/null 2>&1
+}
+
+while :; do
+  # A newer watcher took over
+  [ "$(cat "$STATE_DIR/.watch.pid" 2>/dev/null)" = $$ ] || exit 0
+
+  now=$(date +%s)
+  files=()
+  for f in "$STATE_DIR"/*; do [ -f "$f" ] && files+=("$f"); done
+  if [ ${#files[@]} -eq 0 ]; then
+    if [ $((now - empty_since)) -ge $IDLE_EXIT ]; then rm -f "$STATE_DIR/.watch.pid"; exit 0; fi
+    sleep 1; continue
+  fi
+  empty_since=$now
+
+  if ! list=$("$IT2" session list 2>/dev/null); then sleep 2; continue; fi
+
+  for f in "${files[@]}"; do
+    sid=${f##*/}
+    pending="$STATE_DIR/.pending-$sid"
+    line=$(grep -m1 "^$sid" <<< "$list")
+    if [ -z "$line" ]; then  # tab closed
+      rm -f "$f" "$pending" "$STATE_DIR/.still-$sid"; continue
+    fi
+    IFS=$'\t' read -r _ _ title _ tty <<< "$line"
+    tty=${tty//\\/}
+    state=$(cat "$f" 2>/dev/null)
+    mtime=$(stat -f %m "$f" 2>/dev/null || echo "$now")
+    age=$((now - mtime))
+    still="$STATE_DIR/.still-$sid"  # holds the mtime of the wait it was seen in
+
+    want=
+    case "$title" in
+      "◐"*|"◑"*|"◒"*|"◓"*)
+        [ "$state" = idle ] && want=working
+        [ "$state" = waiting ] && [ "$(cat "$still" 2>/dev/null)" = "$mtime" ] && want=working ;;
+      "✳"*)
+        [ "$state" = working ] && want=idle
+        [ "$state" = waiting ] && echo "$mtime" > "$still" ;;
+      *)  # no Claude title: did claude exit without SessionEnd?
+        ps -t "${tty#/dev/}" -o comm= 2>/dev/null | grep -q claude || want=off ;;
+    esac
+
+    if [ -z "$want" ] || [ "$age" -lt $GRACE ]; then rm -f "$pending"; continue; fi
+    if [ "$(cat "$pending" 2>/dev/null)" != "$want" ]; then echo "$want" > "$pending"; continue; fi
+    rm -f "$pending"
+    case "$want" in
+      working) correct "$sid" "$tty" working PostToolUse ;;
+      idle)    correct "$sid" "$tty" idle Stop ;;
+      off)     correct "$sid" "$tty" off SessionEnd; rm -f "$f" ;;
+    esac
+  done
+  sleep 1
+done

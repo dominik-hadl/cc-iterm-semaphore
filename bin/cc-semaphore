@@ -1,0 +1,130 @@
+#!/bin/bash
+# cc-semaphore — Claude Code hook that shows each session's state in iTerm2.
+#
+#   waiting (needs your input) -> "🔴 WAITING" badge + red tab + Dock bounce
+#   working                    -> "🟡 WORKING" badge + plain tab
+#   idle    (ready for prompt) -> "🟢 READY" badge   + green tab
+#
+# The badge (iTerm2's large faint text in a pane's top-right corner) works for
+# split panes; the tab colour helps when each session has its own tab.
+#
+# Internal states kept in $TMPDIR/cc-semaphore/<iTerm2 session id>:
+#   working, waiting, idle
+#   ask  — waiting on AskUserQuestion / plan approval / MCP elicitation; shown
+#          as waiting, but cc-semaphore-watch never second-guesses it
+#   bg   — turn ended while background tasks run; shown as working
+#
+# Settings (environment, e.g. in ~/.zshenv):
+#   CC_SEMAPHORE_BADGE=0          no badges
+#   CC_SEMAPHORE_BADGE_WAITING / _WORKING / _IDLE   badge texts
+#   CC_SEMAPHORE_TAB=0            no tab colours
+#   CC_SEMAPHORE_WAITING / _IDLE  tab colours (#rrggbb)
+#   CC_SEMAPHORE_BOUNCE=0         no Dock bounce on "waiting"
+#   CC_SEMAPHORE_LOG=/path/file   append every hook event, for debugging
+
+BADGE=${CC_SEMAPHORE_BADGE:-1}
+BADGE_WAITING=${CC_SEMAPHORE_BADGE_WAITING:-🔴 WAITING}
+BADGE_WORKING=${CC_SEMAPHORE_BADGE_WORKING:-🟡 WORKING}
+BADGE_IDLE=${CC_SEMAPHORE_BADGE_IDLE:-🟢 READY}
+TAB=${CC_SEMAPHORE_TAB:-1}
+WAITING=${CC_SEMAPHORE_WAITING:-#e5484d}
+IDLE=${CC_SEMAPHORE_IDLE:-#2fbf71}
+BOUNCE=${CC_SEMAPHORE_BOUNCE:-1}
+STATE_DIR="${TMPDIR:-/tmp}/cc-semaphore"
+
+input=$(cat)
+sid=${ITERM_SESSION_ID#*:}
+[ -n "$sid" ] || exit 0  # not running inside iTerm2
+
+[ -n "$CC_SEMAPHORE_LOG" ] && printf '%s %s %s\n' "$(date +%T)" "$sid" "$input" >> "$CC_SEMAPHORE_LOG"
+
+# \x1f, not tab: read collapses runs of whitespace separators, losing empty fields
+IFS=$'\x1f' read -r event ntype tool bg forced <<< "$(jq -r '[
+    .hook_event_name // "",
+    .notification_type // "",
+    .tool_name // "",
+    ([.background_tasks[]? | select((.status // "running") | test("^(completed|failed|cancell?ed|killed|stopped|done)$") | not)] | length | tostring),
+    .state // ""
+  ] | join("\u001f")' <<< "$input" 2>/dev/null)"
+
+state_file="$STATE_DIR/$sid"
+prev=$(cat "$state_file" 2>/dev/null)
+
+case "$event" in
+  SessionStart)                  state=idle ;;
+  UserPromptSubmit)              state=working ;;
+  PreToolUse)
+    case "$tool" in
+      AskUserQuestion|ExitPlanMode) state=ask ;;
+      *)                            state=working ;;
+    esac ;;
+  PostToolUse|PostToolUseFailure|ElicitationResult) state=working ;;
+  Elicitation)                   state=ask ;;
+  PermissionRequest)  # questions and plans go through the permission flow too
+    case "$tool" in
+      AskUserQuestion|ExitPlanMode) state=ask ;;
+      *)                            state=waiting ;;
+    esac ;;
+  Notification)  # carries no tool name, so it must not downgrade an "ask"
+    case "$ntype" in
+      permission_prompt|elicitation_dialog|elicitation_url_dialog|agent_needs_input)
+        [ "$prev" = ask ] && exit 0
+        state=waiting ;;
+      *) exit 0 ;;
+    esac ;;
+  Stop)  # turn over, but background tasks still running -> still busy
+    if [ "${bg:-0}" -gt 0 ]; then state=bg; else state=idle; fi ;;
+  StopFailure)                   state=waiting ;;  # API error: needs a look
+  SessionEnd)                    state=off ;;
+  SemaphoreWatch)                state=$forced ;;  # correction from cc-semaphore-watch
+  *)                             exit 0 ;;
+esac
+[ -n "$state" ] || exit 0
+[ "$prev" = "$state" ] && exit 0
+mkdir -p "$STATE_DIR"
+
+# Hooks run without a controlling terminal; borrow the one of the nearest
+# ancestor (the claude process) to talk to iTerm2.
+tty=$CC_SEMAPHORE_TTY
+pid=$PPID
+while [ -z "$tty" ] && [ -n "$pid" ] && [ "$pid" -gt 1 ]; do
+  read -r ppid t <<< "$(ps -o ppid=,tty= -p "$pid")"
+  if [ -n "$t" ] && [ "$t" != "??" ]; then tty=/dev/$t; break; fi
+  pid=$ppid
+done
+[ -w "$tty" ] || exit 0
+
+tab_color() {  # #rrggbb ("" resets)
+  [ "$TAB" = 1 ] || [ -z "$1" ] || return
+  if [ -z "$1" ]; then printf '\033]6;1;bg;*;default\a'; return; fi
+  printf '\033]6;1;bg;red;brightness;%d\a\033]6;1;bg;green;brightness;%d\a\033]6;1;bg;blue;brightness;%d\a' \
+    "0x${1:1:2}" "0x${1:3:2}" "0x${1:5:2}"
+}
+
+badge() {  # text ("" clears)
+  [ "$BADGE" = 1 ] || [ -z "$1" ] || return
+  printf '\033]1337;SetBadgeFormat=%s\a' "$(printf '%s' "$1" | base64)"
+}
+
+case "$state" in
+  waiting|ask)
+           seq=$(tab_color "$WAITING"; badge "$BADGE_WAITING")
+           [ "$BOUNCE" = 1 ] && seq+=$'\033]1337;RequestAttention=once\a' ;;
+  idle)    seq=$(tab_color "$IDLE"; badge "$BADGE_IDLE") ;;
+  off)     seq=$(tab_color ""; badge "") ;;
+  *)       seq=$(tab_color ""; badge "$BADGE_WORKING") ;;  # working, bg
+esac
+
+printf '%s' "$seq" > "$tty"
+if [ "$state" = off ]; then
+  rm -f "$state_file" "$STATE_DIR/.pending-$sid" "$STATE_DIR/.still-$sid"
+else
+  echo "$state" > "$state_file"
+  # Hooks miss Esc interrupts and approved permission prompts; the watcher
+  # catches those from Claude's title spinner.
+  watch_pid=$(cat "$STATE_DIR/.watch.pid" 2>/dev/null)
+  if ! { [ -n "$watch_pid" ] && kill -0 "$watch_pid" 2>/dev/null; }; then
+    "$(dirname "$0")/cc-semaphore-watch" </dev/null >/dev/null 2>&1 &
+  fi
+fi
+exit 0

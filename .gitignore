@@ -1,1 +1,3 @@
 .DS_Store
+# the global gitignore excludes bin/
+!bin/
