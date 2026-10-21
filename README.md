@@ -80,4 +80,6 @@ The badge's colour, size and position are iTerm2 profile settings: *Settings →
 - **Plain-text questions show as READY.** If Claude asks something in its reply instead of with the question tool, its turn has ended, so the badge shows 🟢 READY.
 - **Not verified against tmux or SSH sessions.**
 
-Not affiliated with Anthropic or iTerm2.
+## License
+
+[MIT](LICENSE). Not affiliated with Anthropic or iTerm2.
